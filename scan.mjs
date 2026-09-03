@@ -58,7 +58,7 @@ import { fileURLToPath } from 'url';
 import path from 'path';
 import * as yaml from 'js-yaml';
 
-import { makeHttpCtx } from './providers/_http.mjs';
+import { makeHttpCtx, makeStatusObserver } from './providers/_http.mjs';
 import { buildTrustValidator } from './providers/_trust-validator.mjs';
 import { loadProviders, resolveProvider } from './providers/_registry.mjs';
 import { mergeProviderPlugins } from './plugins/_engine.mjs';
@@ -2721,6 +2721,19 @@ export function loadPortalHealth(filePath = PORTAL_HEALTH_PATH) {
   return records;
 }
 
+// What an empty jobs[] from a non-board target is recorded as. It only means
+// "no openings" when the transport also proves the endpoint answered: a
+// provider that resolves without ever completing a 2xx — a cached shell, a
+// JS-rendered board, a silent redirect to a homepage that parses to nothing —
+// yields the same empty array as a genuinely empty board, and those are not the
+// same claim. Judged only when at least one request went through the observed
+// ctx: a target that made none (local-parser, keyed plugin providers, which get
+// the plugin engine's own ctx) gave the observer nothing to judge, so it keeps
+// the plain 'empty' it had before this check.
+export function classifyZeroResult(observer) {
+  return !observer.attempted() || observer.sawSuccess() ? 'empty' : 'unverified_zero';
+}
+
 export function computeConsecutiveFailures(healthRecords) {
   const streaks = new Map();
   for (const r of healthRecords) {
@@ -2728,6 +2741,7 @@ export function computeConsecutiveFailures(healthRecords) {
     // Inverted (vs. listing failure statuses) so the newer error kinds
     // (auth/server/unknown) can't silently fall outside the streak again.
     // 'empty' is deliberately healthy: a live board with 0 jobs is reachable.
+    // 'unverified_zero' counts: liveness was never proven — the same outcome the dead-board contract (#2374/#2379) gives a provider that throws on a failed first request.
     if (r.status === 'reachable' || r.status === 'empty') {
       streaks.set(r.company, 0);
     } else {
@@ -3081,6 +3095,12 @@ async function main() {
             company: entry.name,
             method: 'websearch',
             query: entry.scan_query || entry.search_query || entry.careers_url || '',
+            // A `site:` query returns zero results identically for a dead board
+            // and a board with no matching roles; no status code is ever
+            // observed. Neither guardrail can hold here — that is a property of
+            // the method, not of the company — so the zero this path produces is
+            // marked unenforceable rather than reported as an observed empty board.
+            guardrails: 'unenforceable',
           });
         }
         continue;
@@ -3148,6 +3168,10 @@ async function main() {
   const newOffers = [];
   const errors = [...resolveErrors];
   const emptyTargets = [];
+  // Zeros that could not be proven: jobs[] came back empty AND no 2xx was ever
+  // observed for that company. Deliberately not merged into emptyTargets —
+  // "no openings" and "we never got an answer" are different claims.
+  const unverifiedZeroTargets = [];
 
   // Arm the failure-path row (#2643) now that the sweep is about to start and
   // every counter it reads is in scope. new_added is hardcoded 0 on a failed
@@ -3191,8 +3215,9 @@ async function main() {
     // postings on later pages go unfetched. Documented in modes/scan.md; the
     // fix belongs in workday.mjs, where closing it costs the optimisation on
     // every tenant that mixes.
+    const statusObserver = makeStatusObserver();
     const ctx = {
-      ...makeHttpCtx(),
+      ...makeHttpCtx(statusObserver),
       sinceMs: earlyStopSinceMs,
       includeUndated: true,
       locationHints: config.location_filter,
@@ -3219,7 +3244,14 @@ async function main() {
       }
       totalFound += jobs.length;
       if (!company._isBoard && jobs.length === 0) {
-        emptyTargets.push(company.name);
+        if (classifyZeroResult(statusObserver) === 'empty') {
+          emptyTargets.push(company.name);
+        } else {
+          unverifiedZeroTargets.push({
+            company: company.name,
+            statuses: statusObserver.statuses(),
+          });
+        }
       }
 
       for (const job of jobs) {
@@ -3372,6 +3404,11 @@ async function main() {
         company: company.name,
         error: err.message,
         kind: classifyFetchError(err),
+        // The status already exists on the error (providers/_http.mjs sets
+        // err.status when it throws on a non-ok response) and used to be
+        // dropped here. null means no response was ever received.
+        status: err?.status ?? null,
+        statuses: statusObserver.statuses(),
       });
     }
   });
@@ -3595,9 +3632,15 @@ async function main() {
   );
   for (const t of targets) {
     const isEmpty = emptyTargets.includes(t.name);
+    const isUnverifiedZero = unverifiedZeroTargets.some((u) => u.company === t.name);
 
     let status = errorKindByCompany.get(t.name) || 'reachable';
     if (status === 'reachable' && isEmpty) status = 'empty';
+    // Additive to the status vocabulary, like auth/server/unknown before it.
+    // Deliberately NOT 'empty': writing an unproven zero into health history as
+    // an empty board is the exact defect these guardrails exist to prevent, and
+    // computeConsecutiveFailures reads this vocabulary.
+    if (status === 'reachable' && isUnverifiedZero) status = 'unverified_zero';
 
     healthRecords.push({ timestamp: nowStr, company: t.name, status });
   }
@@ -3635,6 +3678,11 @@ async function main() {
   }
   if (emptyTargets.length > 0) {
     console.log(`🟡 ${emptyTargets.length} target(s) live but empty: ${emptyTargets.join(', ')}`);
+  }
+  if (unverifiedZeroTargets.length > 0) {
+    const names = unverifiedZeroTargets.map((u) => u.company).join(', ');
+    console.log(`\n🔶 ${unverifiedZeroTargets.length} target(s) returned zero WITHOUT a successful response: ${names}`);
+    console.log(`   Not recorded as empty — a dead board and an empty board are indistinguishable here. Verify manually.`);
   }
   if (newlyDeadNetwork.length > 0) {
     console.log(`\nNetwork errors (${newlyDeadNetwork.length}):`);

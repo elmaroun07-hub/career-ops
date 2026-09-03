@@ -27,7 +27,7 @@ async function fetchWithTimeout(url, opts = {}, consume) {
   return providerFetchContext.run({ url: String(url) }, () => fetchInContext(url, opts, consume));
 }
 
-async function fetchInContext(url, { timeoutMs = DEFAULT_TIMEOUT_MS, headers = {}, method = 'GET', body = null, redirect = 'follow' } = {}, consume) {
+async function fetchInContext(url, { timeoutMs = DEFAULT_TIMEOUT_MS, headers = {}, method = 'GET', body = null, redirect = 'follow', onResponse = null } = {}, consume) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -51,6 +51,11 @@ async function fetchInContext(url, { timeoutMs = DEFAULT_TIMEOUT_MS, headers = {
       redirect,
       signal: controller.signal,
     });
+    // Fires before the ok/not-ok branch, so an observer sees the true status on
+    // every completed exchange — not only the ones that throw. A request that
+    // never reaches a response (DNS, TLS, timeout, abort) never fires this,
+    // which is exactly the distinction the zero-result guardrail relies on.
+    onResponse?.(res.status);
     if (!res.ok) {
       const responseText = await res.text().catch(() => '');
       // WAF/CDN challenge pages (seen live: Workday 429s) carry no actionable
@@ -332,11 +337,65 @@ export async function fetchTextWithRetry(ctx, url, opts = {}, policy = {}) {
   return withRetry(() => ctx.fetchText(url, opts), ctx, policy);
 }
 
-export function makeHttpCtx() {
+// Guardrails added by Houssain El Marouni, 2026-09-03.
+// A broken board and a board with no openings produced the
+// same observable result: zero postings. A board can fail
+// hard (404, 500, TCP timeout) or silently, resolving to an
+// empty list. The observer below records what each exchange
+// actually returned so scan.mjs can tell the two apart.
+//
+// The observer is optional and per-ctx. scan.mjs builds one ctx per company,
+// so this stays concurrency-safe under parallelFetch with no shared mutable
+// state. Callers that pass no observer get the original object back unchanged.
+// Duck-typed rather than truthy: audit-portals.mjs passes an options object
+// here, which predates the observer and must keep being ignored.
+export function makeHttpCtx(observer = null) {
+  if (typeof observer?.record !== 'function') {
+    return {
+      transport: 'http',
+      fetchJson,
+      fetchText,
+      fetchResponse,
+    };
+  }
+  const watch = (fn) => (url, opts = {}) => {
+    observer.attempt?.(url);
+    return fn(url, { ...opts, onResponse: (status) => observer.record(url, status) })
+      .catch((err) => {
+        // An error carrying no .status never reached a response at all, so
+        // onResponse never fired. Record the attempt so "we tried and got
+        // nothing back" stays distinguishable from "we never tried".
+        if (err?.status === undefined) observer.record(url, null);
+        throw err;
+      });
+  };
   return {
     transport: 'http',
-    fetchJson,
-    fetchText,
-    fetchResponse,
+    fetchJson: watch(fetchJson),
+    fetchText: watch(fetchText),
+    fetchResponse: watch(fetchResponse),
+  };
+}
+
+// Collects every HTTP status observed while one company is being fetched.
+export function makeStatusObserver() {
+  const seen = [];
+  let attempts = 0;
+  return {
+    attempt() {
+      attempts += 1;
+    },
+    record(url, status) {
+      seen.push({ url, status });
+    },
+    statuses: () => seen.slice(),
+    // True once any request went through the observed ctx. A provider that
+    // never touches ctx (local-parser; keyed plugin providers, which get the
+    // plugin engine's own ctx) leaves this false, and its zero is not judged.
+    attempted: () => attempts > 0,
+    // The positive signal a zero result must clear: at least one exchange
+    // completed 2xx. Once a request was attempted, only non-2xx or only
+    // transport failures are each a reason to withhold a zero, not record one.
+    sawSuccess: () => seen.some((s) => typeof s.status === 'number' && s.status >= 200 && s.status < 300),
   };
 }
